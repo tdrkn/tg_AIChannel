@@ -8,7 +8,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     bot_token: str
-    google_api_key: str
+    # Google Gemini API key (single). Prefer GOOGLE_API_KEYS if you want rotation.
+    google_api_key: Optional[str] = None
+    # Optional list of keys for rotation on quota (JSON list or comma-separated string)
+    google_api_keys: list[str] = Field(default_factory=list)
     target_channel_id: str
     news_rss_urls: Optional[str] = None  # Comma-separated RSS URLs
     post_template: Optional[str] = None  # e.g., "Title: {title}\nSummary: {summary}\nLink: {link}"
@@ -79,6 +82,35 @@ class Settings(BaseSettings):
     # NOTE: We disable automatic JSON-decoding for complex fields so that we can
     # support both JSON and simple comma-separated formats from .env.
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", enable_decoding=False)
+
+    @field_validator("google_api_keys", mode="before")
+    @classmethod
+    def _parse_google_api_keys(cls, v):
+        """Supports JSON list (["k1","k2"]) and convenient 'k1,k2' formats."""
+        if v is None or v == "":
+            return []
+        if isinstance(v, list):
+            out: list[str] = []
+            for x in v:
+                s = str(x).strip()
+                if s:
+                    out.append(s)
+            return out
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return []
+            if s.startswith("["):
+                try:
+                    parsed = json.loads(s)
+                    if isinstance(parsed, list):
+                        return [str(x).strip() for x in parsed if str(x).strip()]
+                except Exception:
+                    return []
+            # Comma-separated (allow accidental spaces)
+            parts = [p.strip() for p in s.split(",") if p.strip()]
+            return parts
+        return []
 
     @field_validator("admin_user_ids", mode="before")
     @classmethod

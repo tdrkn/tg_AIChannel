@@ -15,8 +15,26 @@ logger = logging.getLogger(__name__)
 class LLMService:
     def __init__(self):
         self.settings = get_settings()
+
+        self._google_api_keys: list[str] = []
+        # Prefer rotation list if provided
+        if getattr(self.settings, "google_api_keys", None):
+            self._google_api_keys.extend([k for k in self.settings.google_api_keys if str(k).strip()])
         if self.settings.google_api_key:
-            genai.configure(api_key=self.settings.google_api_key)
+            self._google_api_keys.append(self.settings.google_api_key)
+        # De-duplicate while preserving order
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for k in self._google_api_keys:
+            if k not in seen:
+                deduped.append(k)
+                seen.add(k)
+        self._google_api_keys = deduped
+        self._google_api_key_idx = 0
+
+        if self._google_api_keys:
+            genai.configure(api_key=self._google_api_keys[self._google_api_key_idx])
+            logger.info(f"Configured Google API key 1/{len(self._google_api_keys)}")
             
             # Prioritized list of models to try
             self.model_names = [
@@ -30,7 +48,7 @@ class LLMService:
             self.text_model = genai.GenerativeModel(self.current_model_name)
             logger.info(f"Initialized with model: {self.current_model_name}")
         else:
-            logger.warning("GOOGLE_API_KEY not set. text generation will fail.")
+            logger.warning("GOOGLE_API_KEY(S) not set. text generation will fail.")
             self.text_model = None
 
         if self.settings.openai_api_key:
@@ -38,6 +56,29 @@ class LLMService:
         else:
             logger.warning("OPENAI_API_KEY not set. Image generation will fail.")
             self.openai_client = None
+
+    def _can_rotate_google_key(self) -> bool:
+        return len(self._google_api_keys) > 1
+
+    def _rotate_google_key(self) -> bool:
+        if not self._can_rotate_google_key():
+            return False
+        self._google_api_key_idx = (self._google_api_key_idx + 1) % len(self._google_api_keys)
+        genai.configure(api_key=self._google_api_keys[self._google_api_key_idx])
+        # Re-init current model under the new key
+        self.text_model = genai.GenerativeModel(self.current_model_name)
+        logger.warning(f"Rotated Google API key to {self._google_api_key_idx + 1}/{len(self._google_api_keys)}")
+        return True
+
+    @staticmethod
+    def _is_quota_error(err: Exception) -> bool:
+        msg = str(err).lower()
+        return (
+            isinstance(err, exceptions.ResourceExhausted)
+            or "quota" in msg
+            or "rate limit" in msg
+            or "429" in msg
+        )
 
     async def _generate_with_retry(self, prompt: str, retries: int = 3, delay: int = 5) -> str:
         """Helper to retry generation on 429 errors or switch models."""
@@ -47,6 +88,10 @@ class LLMService:
                 return response.text
             except (exceptions.ResourceExhausted, exceptions.NotFound) as e:
                 logger.warning(f"Model {self.current_model_name} failed: {e}. Attempt {attempt + 1}/{retries}")
+
+                # If quota/rate limit is hit, try rotating the API key first (if available).
+                if self._is_quota_error(e) and self._rotate_google_key():
+                    continue
                 
                 # Try to switch to next model
                 current_idx = -1
