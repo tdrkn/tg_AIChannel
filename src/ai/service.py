@@ -39,6 +39,7 @@ class LLMService:
             # Prioritized list of models to try
             self.model_names = [
                 'gemini-3-flash-preview',
+                'gemini-3-flash',
                 #'gemini-2.5-flash', 
                 'gemini-2.0-flash', 
                 'gemini-1.5-flash',
@@ -89,26 +90,38 @@ class LLMService:
             except (exceptions.ResourceExhausted, exceptions.NotFound, exceptions.GoogleAPIError) as e:
                 logger.warning(f"Model {self.current_model_name} failed: {e}. Attempt {attempt + 1}/{retries}")
 
-                # If quota/rate limit is hit, try rotating the API key first (if available).
-                if self._is_quota_error(e) and self._rotate_google_key():
-                    continue
+                quota_hit = self._is_quota_error(e)
+                rotated = False
+                if quota_hit:
+                    rotated = self._rotate_google_key()
 
-                # Try to switch to next model
                 current_idx = -1
                 if self.current_model_name in self.model_names:
                     current_idx = self.model_names.index(self.current_model_name)
 
+                # On quota: also try a different model to avoid per-model quota exhaustion
+                if quota_hit and current_idx + 1 < len(self.model_names):
+                    self.current_model_name = self.model_names[current_idx + 1]
+                    logger.info(f"Switching to fallback model after quota: {self.current_model_name}")
+                    self.text_model = genai.GenerativeModel(self.current_model_name)
+                    continue
+
+                # Generic model fallback
                 if current_idx + 1 < len(self.model_names):
                     self.current_model_name = self.model_names[current_idx + 1]
                     logger.info(f"Switching to fallback model: {self.current_model_name}")
                     self.text_model = genai.GenerativeModel(self.current_model_name)
-                    # Don't sleep, just try immediately with new model
                     continue
-                else:
-                    # No more models, wait and retry current (last) model
-                    logger.warning("All models exhausted or hitting limits. Sleeping...")
-                    await asyncio.sleep(delay)
-                    delay *= 2
+
+                # Quota hit, rotated key, but no other models left: retry same model with new key
+                if quota_hit and rotated:
+                    logger.info("Retrying current model with rotated key after quota.")
+                    continue
+
+                # No options left: backoff
+                logger.warning("All models exhausted or hitting limits. Sleeping...")
+                await asyncio.sleep(delay)
+                delay *= 2
             except ValueError as e:
                 # Happens when response has no text (finish_reason != 0). Treat as transient: try next model.
                 logger.warning(f"Empty/blocked response on model {self.current_model_name}: {e}. Attempt {attempt + 1}/{retries}")
