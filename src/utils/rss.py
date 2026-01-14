@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 async def fetch_feed_content(client: httpx.AsyncClient, url: str) -> Optional[str]:
     try:
-        response = await client.get(url, timeout=10.0)
+        response = await client.get(url, timeout=10.0, follow_redirects=True)
         response.raise_for_status()
         return response.text
     except Exception as e:
@@ -25,7 +25,7 @@ async def fetch_rss_entries(rss_urls: List[str], hours: int = 6) -> List[Dict]:
     entries = []
     since_time = datetime.utcnow() - timedelta(hours=hours)
     
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(follow_redirects=True) as client:
         tasks = [fetch_feed_content(client, url) for url in rss_urls]
         contents = await asyncio.gather(*tasks)
 
