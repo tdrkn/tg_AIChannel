@@ -223,11 +223,17 @@ async def run_pipeline(bot: Optional[Bot] = None, allow_auto_publish: bool = Tru
             
             winner_item = candidates_dicts[winner_idx]
             if bot and settings.admin_user_ids:
-                 await bot.send_message(settings.admin_user_ids[0], f"🏆 Winner selected: {winner_item['title']}\n🕵️‍♀️ Researching...")
+                 await bot.send_message(
+                     settings.admin_user_ids[0],
+                     f"🏆 Winner selected: {winner_item['title']}\n🕵️‍♀️ Researching... (model: {llm_service.current_model() or 'n/a'}, key: {llm_service.current_key_slot() or 'n/a'})",
+                 )
             search_queries = selection.get("search_queries", [])
             
             if bot and settings.admin_user_ids:
-                 await bot.send_message(settings.admin_user_ids[0], "✍️ Generating post content and image...")
+                 await bot.send_message(
+                     settings.admin_user_ids[0],
+                     f"✍️ Generating post content and image... (model: {llm_service.current_model() or 'n/a'}, key: {llm_service.current_key_slot() or 'n/a'})",
+                 )
 
             logger.info(f"Winner selected: {winner_item['title']}")
             

@@ -61,6 +61,14 @@ class LLMService:
     def _can_rotate_google_key(self) -> bool:
         return len(self._google_api_keys) > 1
 
+    def current_model(self) -> Optional[str]:
+        return getattr(self, "current_model_name", None)
+
+    def current_key_slot(self) -> Optional[str]:
+        if not self._google_api_keys:
+            return None
+        return f"{self._google_api_key_idx + 1}/{len(self._google_api_keys)}"
+
     def _rotate_google_key(self) -> bool:
         if not self._can_rotate_google_key():
             return False
