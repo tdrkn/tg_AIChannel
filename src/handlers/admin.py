@@ -1,4 +1,5 @@
 from datetime import datetime
+import html
 from aiogram import Router, types
 from aiogram.filters import Command
 from aiogram.types import URLInputFile
@@ -85,7 +86,7 @@ async def cmd_run(message: types.Message):
         count = await run_pipeline(bot=message.bot, allow_auto_publish=False)
         await message.answer(f"✅ Pipeline finished. Ingested {count} items.")
     except Exception as e:
-        await message.answer(f"❌ Pipeline failed: {str(e)}")
+        await message.answer(f"❌ Pipeline failed: {html.escape(str(e))}")
 
 @router.message(Command("preview"))
 async def cmd_preview(message: types.Message):
@@ -111,8 +112,8 @@ async def cmd_preview(message: types.Message):
                     await message.bot.send_photo(chat_id=message.chat.id, photo=_photo_ref(post.image_url), caption=msg_text)
             else:
                 await message.answer(msg_text)
-        except Exception as e:
-             await message.answer(f"Error showing preview: {e}\n\n{msg_text}")
+           except Exception as e:
+               await message.answer(f"Error showing preview: {html.escape(str(e))}\n\n{msg_text}")
 
 @router.message(Command("publish"))
 async def cmd_publish(message: types.Message):
@@ -158,7 +159,7 @@ async def cmd_publish(message: types.Message):
             await message.answer(f"✅ Published to {settings.target_channel_id}")
             
         except Exception as e:
-            await message.answer(f"❌ Failed to publish: {e}")
+            await message.answer(f"❌ Failed to publish: {html.escape(str(e))}")
 
 @router.message(Command("reject"))
 async def cmd_reject(message: types.Message):
