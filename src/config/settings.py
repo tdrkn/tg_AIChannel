@@ -1,6 +1,8 @@
 from functools import lru_cache
+import json
 from typing import Optional
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -75,6 +77,47 @@ class Settings(BaseSettings):
         return f"postgresql+asyncpg://{self.postgres_user}:{self.postgres_password}@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+
+    @field_validator("source_candidate_caps", mode="before")
+    @classmethod
+    def _parse_source_candidate_caps(cls, v):
+        """Supports both JSON and a convenient 'name=4,name2=2' format."""
+        if v is None or v == "":
+            return {}
+        if isinstance(v, dict):
+            return {str(k): int(vv) for k, vv in v.items()}
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return {}
+
+            # JSON style: {"The Verge": 4, "vc.ru": 6}
+            if s.startswith("{"):
+                parsed = json.loads(s)
+                if isinstance(parsed, dict):
+                    return {str(k): int(vv) for k, vv in parsed.items()}
+                return {}
+
+            # Convenient style: The Verge=4,vc.ru=6,TechCrunch:3
+            out: dict[str, int] = {}
+            parts = [p.strip() for p in s.split(",") if p.strip()]
+            for part in parts:
+                if "=" in part:
+                    k, vv = part.split("=", 1)
+                elif ":" in part:
+                    k, vv = part.split(":", 1)
+                else:
+                    continue
+                key = k.strip().strip('"').strip("'")
+                val = vv.strip().strip('"').strip("'")
+                if not key:
+                    continue
+                try:
+                    out[key] = int(float(val))
+                except Exception:
+                    continue
+            return out
+        return {}
 
 
 @lru_cache
