@@ -112,8 +112,8 @@ async def cmd_preview(message: types.Message):
                     await message.bot.send_photo(chat_id=message.chat.id, photo=_photo_ref(post.image_url), caption=msg_text)
             else:
                 await message.answer(msg_text)
-           except Exception as e:
-               await message.answer(f"Error showing preview: {html.escape(str(e))}\n\n{msg_text}")
+        except Exception as e:
+            await message.answer(f"Error showing preview: {html.escape(str(e))}\n\n{msg_text}")
 
 @router.message(Command("publish"))
 async def cmd_publish(message: types.Message):
