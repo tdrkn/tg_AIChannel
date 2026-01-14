@@ -1,0 +1,13 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Run Bot",
+			"type": "shell",
+			"command": "python src/main.py",
+			"args": [],
+			"isBackground": false,
+			"group": "none"
+		}
+	]
+}
