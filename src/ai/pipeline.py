@@ -111,7 +111,7 @@ def _balance_candidates_by_source(
             made_progress = True
     return out
 
-async def run_pipeline(bot: Optional[Bot] = None):
+async def run_pipeline(bot: Optional[Bot] = None, allow_auto_publish: bool = True):
     settings = get_settings()
     llm_service = LLMService()
     logger.info("Starting pipeline run...")
@@ -299,7 +299,7 @@ async def run_pipeline(bot: Optional[Bot] = None):
             await session.commit()
 
             # 8. Auto Publish (if enabled), otherwise notify admin with draft preview
-            if settings.auto_publish and bot:
+            if settings.auto_publish and allow_auto_publish and bot:
                 published = await _publish_to_channel(bot, new_post, settings)
                 if published:
                     await session.commit()

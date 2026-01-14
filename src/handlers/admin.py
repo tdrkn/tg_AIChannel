@@ -82,7 +82,7 @@ async def cmd_run(message: types.Message):
     
     await message.answer("🚀 Pipeline started manually...")
     try:
-        count = await run_pipeline(bot=message.bot)
+        count = await run_pipeline(bot=message.bot, allow_auto_publish=False)
         await message.answer(f"✅ Pipeline finished. Ingested {count} items.")
     except Exception as e:
         await message.answer(f"❌ Pipeline failed: {str(e)}")

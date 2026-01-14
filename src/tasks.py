@@ -10,4 +10,4 @@ async def periodic_job(bot: Bot):
         logging.info("Scheduler: Auto-publish is PAUSED. Skipping run.")
         return
     
-    await run_pipeline(bot=bot)
+    await run_pipeline(bot=bot, allow_auto_publish=True)
