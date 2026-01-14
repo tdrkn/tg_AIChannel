@@ -39,7 +39,7 @@ class LLMService:
             # Prioritized list of models to try
             self.model_names = [
                 'gemini-3-flash-preview',
-                'gemini-2.5-flash', 
+                #'gemini-2.5-flash', 
                 'gemini-2.0-flash', 
                 'gemini-1.5-flash',
                 'gemini-1.5-pro'
@@ -86,18 +86,18 @@ class LLMService:
             try:
                 response = await self.text_model.generate_content_async(prompt)
                 return response.text
-            except (exceptions.ResourceExhausted, exceptions.NotFound) as e:
+            except (exceptions.ResourceExhausted, exceptions.NotFound, exceptions.GoogleAPIError) as e:
                 logger.warning(f"Model {self.current_model_name} failed: {e}. Attempt {attempt + 1}/{retries}")
 
                 # If quota/rate limit is hit, try rotating the API key first (if available).
                 if self._is_quota_error(e) and self._rotate_google_key():
                     continue
-                
+
                 # Try to switch to next model
                 current_idx = -1
                 if self.current_model_name in self.model_names:
                     current_idx = self.model_names.index(self.current_model_name)
-                
+
                 if current_idx + 1 < len(self.model_names):
                     self.current_model_name = self.model_names[current_idx + 1]
                     logger.info(f"Switching to fallback model: {self.current_model_name}")
@@ -109,6 +109,23 @@ class LLMService:
                     logger.warning("All models exhausted or hitting limits. Sleeping...")
                     await asyncio.sleep(delay)
                     delay *= 2
+            except ValueError as e:
+                # Happens when response has no text (finish_reason != 0). Treat as transient: try next model.
+                logger.warning(f"Empty/blocked response on model {self.current_model_name}: {e}. Attempt {attempt + 1}/{retries}")
+
+                current_idx = -1
+                if self.current_model_name in self.model_names:
+                    current_idx = self.model_names.index(self.current_model_name)
+
+                if current_idx + 1 < len(self.model_names):
+                    self.current_model_name = self.model_names[current_idx + 1]
+                    logger.info(f"Switching to fallback model: {self.current_model_name}")
+                    self.text_model = genai.GenerativeModel(self.current_model_name)
+                    continue
+
+                # No other models; backoff and retry current
+                await asyncio.sleep(delay)
+                delay *= 2
             except Exception as e:
                 logger.error(f"Generation error: {e}")
                 raise e
@@ -264,9 +281,21 @@ class LLMService:
             return data
         except Exception as e:
             logger.error(f"Error generating post after retries: {e}", exc_info=True)
-            # Fail gracefully but informatively
+            # Fail gracefully; distinguish quota from other failures.
+            if self._is_quota_error(e):
+                msg = (
+                    "⚠️ <b>Ошибка генерации поста (Google AI Quota).</b>\n\n"
+                    f"Не удалось перевести новость: <b>{winner_item.get('title')}</b>\n\n"
+                    "Попробуйте позже или используйте другой ключ."
+                )
+            else:
+                msg = (
+                    "⚠️ <b>Ошибка генерации поста.</b>\n\n"
+                    f"Не удалось обработать новость: <b>{winner_item.get('title')}</b>\n\n"
+                    "Попробуйте позже или смените модель/ключ."
+                )
             return {
-                "post_text": f"⚠️ <b>Ошибка генерации поста (Google AI Quota).</b>\n\nНе удалось перевести новость: <b>{winner_item.get('title')}</b>\n\nПопробуйте позже.",
+                "post_text": msg,
                 "image_prompt": ""
             }
 
