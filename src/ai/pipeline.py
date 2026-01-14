@@ -27,6 +27,7 @@ def _balance_candidates_by_source(
     items: List[Item],
     total: int,
     max_per_source: int,
+    per_source_caps: Optional[Dict[str, int]] = None,
 ) -> List[Item]:
     """Pick up to `total` items, spreading across sources.
 
@@ -41,6 +42,7 @@ def _balance_candidates_by_source(
     sources = list(by_source.keys())
     per_source_taken: Dict[str, int] = {s: 0 for s in sources}
     idx: Dict[str, int] = {s: 0 for s in sources}
+    caps = per_source_caps or {}
 
     out: List[Item] = []
     made_progress = True
@@ -49,7 +51,10 @@ def _balance_candidates_by_source(
         for s in sources:
             if len(out) >= total:
                 break
-            if per_source_taken[s] >= max_per_source:
+            cap = min(max_per_source, int(caps.get(s, max_per_source)))
+            if cap < 1:
+                cap = 1
+            if per_source_taken[s] >= cap:
                 continue
             if idx[s] >= len(by_source[s]):
                 continue
@@ -125,10 +130,35 @@ async def run_pipeline(bot: Optional[Bot] = None):
             candidates_result = await session.execute(stmt)
             pool = candidates_result.scalars().all()
 
+            # Cooldown: if a source was published recently, reduce its quota in the candidate set.
+            per_source_caps: Dict[str, int] = dict(settings.source_candidate_caps or {})
+            try:
+                cooldown_hours = int(settings.source_cooldown_hours)
+                penalty = int(settings.source_cooldown_cap_penalty)
+            except Exception:
+                cooldown_hours = 6
+                penalty = 2
+
+            if cooldown_hours > 0 and penalty > 0:
+                since = datetime.utcnow() - timedelta(hours=cooldown_hours)
+                stmt_recent = (
+                    select(Item.source)
+                    .join(Post, Post.item_id == Item.id)
+                    .where(Post.status == "published", Post.published_at >= since)
+                    .order_by(Post.published_at.desc())
+                )
+                recent_res = await session.execute(stmt_recent)
+                recent_sources = {((s or "unknown").strip() or "unknown") for (s,) in recent_res.all()}
+                if recent_sources:
+                    for s in recent_sources:
+                        base = int(per_source_caps.get(s, settings.max_candidates_per_source))
+                        per_source_caps[s] = max(1, base - penalty)
+
             candidates = _balance_candidates_by_source(
                 pool,
                 total=settings.candidates_for_llm,
                 max_per_source=settings.max_candidates_per_source,
+                per_source_caps=per_source_caps,
             )
             
             candidates_dicts = [

@@ -47,6 +47,9 @@ class Settings(BaseSettings):
     candidates_for_llm: int = 30
     candidate_pool_multiplier: int = 5
     max_candidates_per_source: int = 6
+    source_candidate_caps: dict[str, int] = {}
+    source_cooldown_hours: int = 6
+    source_cooldown_cap_penalty: int = 2
     web_search_calls_limit: int = 3
     llm_timeout: int = 30
     http_timeout: int = 10
