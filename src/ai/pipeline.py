@@ -23,6 +23,27 @@ def _is_http_url(value: str) -> bool:
     return v.startswith("http://") or v.startswith("https://")
 
 
+async def _publish_to_channel(bot: Bot, post: Post, settings) -> bool:
+    """Publish a post to the target channel and update its status."""
+    try:
+        if post.image_url:
+            photo_ref = URLInputFile(post.image_url) if _is_http_url(post.image_url) else post.image_url
+            if len(post.content) > 1000:
+                await bot.send_photo(chat_id=settings.target_channel_id, photo=photo_ref)
+                await bot.send_message(chat_id=settings.target_channel_id, text=post.content, parse_mode="HTML", disable_web_page_preview=True)
+            else:
+                await bot.send_photo(chat_id=settings.target_channel_id, photo=photo_ref, caption=post.content, parse_mode="HTML")
+        else:
+            await bot.send_message(chat_id=settings.target_channel_id, text=post.content, parse_mode="HTML", disable_web_page_preview=True)
+
+        post.status = "published"
+        post.published_at = datetime.utcnow()
+        return True
+    except Exception as e:
+        logger.error(f"Auto-publish failed: {e}")
+        return False
+
+
 def _balance_candidates_by_source(
     items: List[Item],
     total: int,
@@ -276,8 +297,28 @@ async def run_pipeline(bot: Optional[Bot] = None):
             new_run.log = f"Ingested {saved_count}. Winner: {winner_item['title']}. Draft created."
             
             await session.commit()
-            
-            # 8. Notify Admin / Auto Publish
+
+            # 8. Auto Publish (if enabled), otherwise notify admin with draft preview
+            if settings.auto_publish and bot:
+                published = await _publish_to_channel(bot, new_post, settings)
+                if published:
+                    await session.commit()
+                    new_run.log = f"Ingested {saved_count}. Winner: {winner_item['title']}. Auto-published."
+                    await session.commit()
+                    if settings.admin_user_ids:
+                        try:
+                            await bot.send_message(settings.admin_user_ids[0], f"✅ Auto-published: {winner_item['title']}")
+                        except Exception as ex:
+                            logger.warning(f"Failed to notify admin after auto-publish: {ex}")
+                    return saved_count
+                else:
+                    await session.commit()
+                    if settings.admin_user_ids:
+                        try:
+                            await bot.send_message(settings.admin_user_ids[0], f"⚠️ Auto-publish failed, draft kept: {winner_item['title']}")
+                        except Exception as ex:
+                            logger.warning(f"Failed to notify admin after auto-publish failure: {ex}")
+
             if bot and settings.admin_user_ids:
                 admin_id = settings.admin_user_ids[0]
                 msg_text = f"🆕 <b>Draft Generated</b>\n\n{post_text}\n\n/publish - to publish\n/reject - to discard"
