@@ -23,8 +23,8 @@ class LLMService:
                 'gemini-3-flash-preview',
                 'gemini-2.5-flash', 
                 'gemini-2.0-flash', 
-                'gemini-1.5-flash-latest',
-                'gemini-pro'
+                'gemini-1.5-flash',
+                'gemini-1.5-pro'
             ]
             self.current_model_name = self.model_names[0]
             self.text_model = genai.GenerativeModel(self.current_model_name)

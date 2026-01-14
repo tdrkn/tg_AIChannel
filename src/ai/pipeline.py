@@ -218,6 +218,26 @@ async def run_pipeline(bot: Optional[Bot] = None):
             post_text = content_data.get("post_text", "")
             image_prompt = content_data.get("image_prompt", "")
 
+            # If Google quota is exceeded, don't create a draft post with an error text.
+            # Mark the run as failed and notify admin to retry later.
+            if "Google AI Quota" in (post_text or ""):
+                logger.warning("Google AI quota exceeded; skipping draft creation.")
+                new_run.status = "failed"
+                new_run.end_time = datetime.utcnow()
+                new_run.log = "Google AI quota exceeded during post generation"
+                await session.commit()
+
+                if bot and settings.admin_user_ids:
+                    admin_id = settings.admin_user_ids[0]
+                    await bot.send_message(
+                        chat_id=admin_id,
+                        text=(
+                            "⚠️ <b>Google AI Quota</b> — лимит исчерпан, пост не сгенерирован.\n\n"
+                            "Попробуйте позже (или увеличьте квоту/смените ключ)."
+                        ),
+                    )
+                return saved_count
+
             # Telegram HTML is strict; sanitize LLM output and append a guaranteed-valid footer.
             post_text = sanitize_telegram_html(post_text)
             post_text = append_footer(
