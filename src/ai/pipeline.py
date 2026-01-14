@@ -44,6 +44,32 @@ def _balance_candidates_by_source(
     idx: Dict[str, int] = {s: 0 for s in sources}
     caps = per_source_caps or {}
 
+    def _cap_for_source(source_name: str) -> int:
+        base = max_per_source
+        if not caps:
+            return base
+
+        # Exact match first
+        if source_name in caps:
+            try:
+                return int(caps[source_name])
+            except Exception:
+                return base
+
+        # Case-insensitive substring patterns (e.g. "the verge" matches "The Verge - AI")
+        s_low = source_name.lower()
+        matched: List[int] = []
+        for k, v in caps.items():
+            k_low = str(k).strip().lower()
+            if not k_low:
+                continue
+            if k_low in s_low:
+                try:
+                    matched.append(int(v))
+                except Exception:
+                    continue
+        return min(matched) if matched else base
+
     out: List[Item] = []
     made_progress = True
     while len(out) < total and made_progress:
@@ -51,7 +77,7 @@ def _balance_candidates_by_source(
         for s in sources:
             if len(out) >= total:
                 break
-            cap = min(max_per_source, int(caps.get(s, max_per_source)))
+            cap = min(max_per_source, _cap_for_source(s))
             if cap < 1:
                 cap = 1
             if per_source_taken[s] >= cap:
