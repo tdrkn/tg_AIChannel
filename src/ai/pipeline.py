@@ -10,6 +10,7 @@ from aiogram.types import BufferedInputFile, URLInputFile
 from src.database import async_session_maker
 from src.models import Run, Item, Post
 from src.utils.rss import fetch_rss_entries
+from src.utils.config_db import get_rss_feeds, get_config
 from src.config.settings import get_settings
 from src.ai.service import LLMService
 from src.utils.telegram_html import sanitize_telegram_html, append_footer, channel_id_to_url
@@ -26,19 +27,30 @@ def _is_http_url(value: str) -> bool:
 async def _publish_to_channel(bot: Bot, post: Post, settings) -> bool:
     """Publish a post to the target channel and update its status."""
     try:
+        sent_ok = False
         if post.image_url:
             photo_ref = URLInputFile(post.image_url) if _is_http_url(post.image_url) else post.image_url
-            if len(post.content) > 1000:
-                await bot.send_photo(chat_id=settings.target_channel_id, photo=photo_ref)
+            try:
+                if len(post.content) > 1000:
+                    await bot.send_photo(chat_id=settings.target_channel_id, photo=photo_ref)
+                    await bot.send_message(chat_id=settings.target_channel_id, text=post.content, parse_mode="HTML", disable_web_page_preview=True)
+                else:
+                    await bot.send_photo(chat_id=settings.target_channel_id, photo=photo_ref, caption=post.content, parse_mode="HTML")
+                sent_ok = True
+            except Exception as img_err:
+                logger.warning(f"Failed to send with photo ({img_err}), falling back to text only.")
+                # Fallback to text only
                 await bot.send_message(chat_id=settings.target_channel_id, text=post.content, parse_mode="HTML", disable_web_page_preview=True)
-            else:
-                await bot.send_photo(chat_id=settings.target_channel_id, photo=photo_ref, caption=post.content, parse_mode="HTML")
+                sent_ok = True
         else:
             await bot.send_message(chat_id=settings.target_channel_id, text=post.content, parse_mode="HTML", disable_web_page_preview=True)
+            sent_ok = True
 
-        post.status = "published"
-        post.published_at = datetime.utcnow()
-        return True
+        if sent_ok:
+            post.status = "published"
+            post.published_at = datetime.utcnow()
+            return True
+        return False
     except Exception as e:
         logger.error(f"Auto-publish failed: {e}")
         return False
@@ -113,11 +125,13 @@ def _balance_candidates_by_source(
 
 async def run_pipeline(bot: Optional[Bot] = None, allow_auto_publish: bool = True):
     settings = get_settings()
-    llm_service = LLMService()
+    custom_model = await get_config("llm_model")
+    llm_service = LLMService(preferred_model=custom_model)
     logger.info("Starting pipeline run...")
     
     if bot and settings.admin_user_ids:
-        await bot.send_message(settings.admin_user_ids[0], "🕵️‍♂️ Pipeline started: Fetching RSS feeds...")
+        model_info = custom_model if custom_model else "auto"
+        await bot.send_message(settings.admin_user_ids[0], f"🕵️‍♂️ Пайплайн запущен (LLM: {model_info})...\nПолучаю RSS...")
 
     async with async_session_maker() as session:
         # 1. Create Run record
@@ -128,15 +142,33 @@ async def run_pipeline(bot: Optional[Bot] = None, allow_auto_publish: bool = Tru
         
         try:
             # 2. Fetch RSS
-            rss_urls = settings.news_rss_urls.split(",") if settings.news_rss_urls else []
+            rss_urls = await get_rss_feeds()
             items_data = []
             saved_count = 0
+            current_run_sources: set[str] = set()
+            active_source_names: List[str] = []
             
             if rss_urls:
-                items_data = await fetch_rss_entries(rss_urls, hours=6)
+                if bot and settings.admin_user_ids:
+                     await bot.send_message(
+                         settings.admin_user_ids[0],
+                         f"📡 RSS: настроено лент — {len(rss_urls)}. Начинаю загрузку...",
+                     )
+                items_data, active_source_names = await fetch_rss_entries(rss_urls, hours=6)
+
+                # Track sources seen in the CURRENT RSS fetch (from actual items + active sources)
+                if active_source_names:
+                    current_run_sources.update(active_source_names)
+                     
+                for it in items_data:
+                    src = (it.get("source") or "unknown").strip() or "unknown"
+                    current_run_sources.add(src)
                 
                 if bot and settings.admin_user_ids:
-                     await bot.send_message(settings.admin_user_ids[0], f"📥 Fetched {len(items_data)} items. Filtering...")
+                    await bot.send_message(
+                        settings.admin_user_ids[0],
+                        f"📥 Получено {len(items_data)} новостей из {len(active_source_names)} активных источников.",
+                    )
 
                 # Filter limits
                 if len(items_data) > settings.max_items_per_run:
@@ -160,7 +192,16 @@ async def run_pipeline(bot: Optional[Bot] = None, allow_auto_publish: bool = Tru
                 await session.commit()
             
             new_run.items_count = saved_count
-            logger.info(f"Ingested {saved_count} items.")
+            logger.info(f"Ingested {saved_count} items from sources: {', '.join(sorted(current_run_sources)) if current_run_sources else 'none'}")
+
+            if bot and settings.admin_user_ids:
+                await bot.send_message(
+                    settings.admin_user_ids[0],
+                    f"🧹 Сохранено после дедупликации: {saved_count}.",
+                )
+            
+            if not current_run_sources and rss_urls:
+                logger.warning(f"⚠️ No new items fetched from RSS! Sources checked: {len(rss_urls)}")
             
             # 4. Select Candidate
             # Get fresh items from DB (last 24 hours), excluding items already posted/drafted
@@ -169,13 +210,34 @@ async def run_pipeline(bot: Optional[Bot] = None, allow_auto_publish: bool = Tru
             used_items_subquery = select(Post.item_id).where(Post.item_id.is_not(None))
             
             pool_limit = max(settings.candidates_for_llm * settings.candidate_pool_multiplier, settings.candidates_for_llm)
-            stmt = select(Item).where(
+            where_clauses = [
                 Item.published_at >= datetime.utcnow() - timedelta(hours=24),
-                Item.id.not_in(used_items_subquery)
-            ).order_by(Item.published_at.desc()).limit(pool_limit)
+                Item.id.not_in(used_items_subquery),
+            ]
+
+            # IMPROVED: Strictly filter by active sources to solve "old items from disabled newsletters" issue.
+            # We only fallback to ALL sources if we have NO active sources detected (e.g. network error).
+            if current_run_sources:
+                where_clauses.append(Item.source.in_(sorted(current_run_sources)))
+                logger.info(f"📌 Restricting to {len(current_run_sources)} active sources.")
+            elif rss_urls:
+                # If we have RSS configured but detected no active sources, it might be a network failure.
+                # In this case we MIGHT want to use old items, but the user explicitly wants to avoid "disabled newsletters".
+                # To be safe, we warn.
+                logger.warning(f"📌 No active sources detected! Using ALL DB candidates (Potential risk of using disabled sources if they are in DB).")
+
+            stmt = select(Item).where(*where_clauses).order_by(Item.published_at.desc()).limit(pool_limit)
             
             candidates_result = await session.execute(stmt)
             pool = candidates_result.scalars().all()
+            
+            logger.info(f"Candidate pool size: {len(pool)} items (limit: {pool_limit})")
+
+            if bot and settings.admin_user_ids:
+                await bot.send_message(
+                    settings.admin_user_ids[0],
+                    f"🎯 Пул кандидатов: {len(pool)} (лимит {pool_limit}). Выбираю победителя...",
+                )
 
             # Cooldown: if a source was published recently, reduce its quota in the candidate set.
             per_source_caps: Dict[str, int] = dict(settings.source_candidate_caps or {})
@@ -225,7 +287,7 @@ async def run_pipeline(bot: Optional[Bot] = None, allow_auto_publish: bool = Tru
             if bot and settings.admin_user_ids:
                  await bot.send_message(
                      settings.admin_user_ids[0],
-                     f"🏆 Winner selected: {winner_item['title']}\n🕵️‍♀️ Researching... (model: {llm_service.current_model() or 'n/a'}, key: {llm_service.current_key_slot() or 'n/a'})",
+                     f"🏆 Winner selected: {winner_item['title']}\n� Source: {winner_item.get('source', 'unknown')}\n�🕵️‍♀️ Researching... (model: {llm_service.current_model() or 'n/a'}, key: {llm_service.current_key_slot() or 'n/a'})",
                  )
             search_queries = selection.get("search_queries", [])
             
@@ -235,7 +297,7 @@ async def run_pipeline(bot: Optional[Bot] = None, allow_auto_publish: bool = Tru
                      f"✍️ Generating post content and image... (model: {llm_service.current_model() or 'n/a'}, key: {llm_service.current_key_slot() or 'n/a'})",
                  )
 
-            logger.info(f"Winner selected: {winner_item['title']}")
+            logger.info(f"Winner selected: {winner_item['title']} (source: {winner_item.get('source', 'unknown')})")
             
             # 5. Research
             research_context = await llm_service.research_topic(search_queries)
@@ -364,6 +426,107 @@ async def run_pipeline(bot: Optional[Bot] = None, allow_auto_publish: bool = Tru
             logger.error(f"Pipeline failed: {e}", exc_info=True)
             new_run.status = "failed"
             new_run.end_time = datetime.utcnow()
-            new_run.log = str(e)
+
+async def process_manual_url(url: str, bot: Bot):
+    """Process a single manual URL immediately."""
+    settings = get_settings()
+    custom_model = await get_config("llm_model")
+    llm_service = LLMService(preferred_model=custom_model)
+    
+    admin_id = settings.admin_user_ids[0] if settings.admin_user_ids else None
+    
+    if admin_id:
+        await bot.send_message(admin_id, f"🔗 Obrabotka ssylki: {url}")
+
+    async with async_session_maker() as session:
+        # Check if exists
+        exists = await session.scalar(select(Item).where(Item.link == url))
+        if exists:
+             item = exists
+        else:
+            # Create a dummy item
+            item = Item(
+                title="Manual Entry",
+                link=url,
+                summary="Manual processing requested.",
+                source="Manual",
+                published_at=datetime.utcnow()
+            )
+            session.add(item)
             await session.commit()
-            raise e
+            await session.refresh(item)
+        
+        # We need a proper title for better results
+        # We'll just pass it to LLM and let it figure it out from research context?
+        # Or try to fetch it.
+        # But we don't have a specific title fetcher.
+        # We'll rely on research.
+        
+        winner_item = {
+            "title": item.title,
+            "source": "Manual",
+            "summary": "User manually requested processing of this URL.",
+            "link": url,
+            "id": item.id
+        }
+        
+        # 1. Research (this will fetch the content essentially)
+        # We fake the search query as the URL itself or just "summary of <url>"
+        if admin_id:
+             await bot.send_message(admin_id, f"🔎 Читаю страницу...")
+             
+        # Use web_search to get content?
+        # Our web_search function puts "Src: title \n URL... Content..."
+        # If we pass the URL as query, DDG might return it?
+        # Actually LLMService.research_topic calls web_search using queries.
+        # Let's try to get content directly if possible, but we don't have a direct fetcher exposed in service.
+        # So we'll trust research_topic.
+        
+        research_context = await llm_service.research_topic([f"summarize {url}", url])
+        
+        # 2. Generate
+        if admin_id:
+             await bot.send_message(admin_id, f"📝 Пишу пост...")
+        
+        content_data = await llm_service.generate_post(winner_item, research_context)
+        post_text = content_data.get("post_text", "")
+        image_prompt = content_data.get("image_prompt", "")
+        
+        article_link = url
+        image_url = await fetch_article_image_url(article_link, timeout_sec=settings.http_timeout)
+        if not image_url and image_prompt:
+             image_url = await llm_service.generate_image(image_prompt)
+             
+        # Save Draft manually (we don't have a Run ID here easily, or create one?)
+        new_run = Run(status="manual", log=f"Manual URL: {url}")
+        session.add(new_run)
+        await session.commit()
+        
+        new_post = Post(
+            run_id=new_run.id,
+            item_id=item.id,
+            title="Manual Post",
+            content=post_text,
+            image_prompt=image_prompt,
+            image_url=image_url,
+            status="draft"
+        )
+        session.add(new_post)
+        await session.commit()
+        
+    # Notify
+    if admin_id:
+        msg_text = f"🆕 <b>Manual Draft</b>\n\n{post_text}\n\n/publish - publish\n/reject - discard"
+        try:
+            if image_url:
+                photo_ref = URLInputFile(image_url) if _is_http_url(image_url) else image_url
+                if len(msg_text) > 1000:
+                    await bot.send_photo(chat_id=admin_id, photo=photo_ref)
+                    await bot.send_message(chat_id=admin_id, text=msg_text)
+                else:
+                    await bot.send_photo(chat_id=admin_id, photo=photo_ref, caption=msg_text)
+            else:
+                await bot.send_message(chat_id=admin_id, text=msg_text)
+        except Exception as e:
+            await bot.send_message(chat_id=admin_id, text=f"Draft saved but preview failed: {e}\n\n{msg_text}")
+

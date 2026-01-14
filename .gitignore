@@ -207,3 +207,4 @@ $RECYCLE.BIN/
 # Add your own custom ignores here
 
 
+.env.*

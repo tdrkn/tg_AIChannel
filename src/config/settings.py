@@ -18,6 +18,8 @@ class Settings(BaseSettings):
     
     # AI Persona
     system_prompt: Optional[str] = None
+    # Optional: load SYSTEM_PROMPT from a file (recommended to avoid multiline .env issues)
+    system_prompt_file: Optional[str] = None
 
     # Database
     postgres_user: str = "postgres"

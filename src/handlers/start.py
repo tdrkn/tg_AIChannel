@@ -6,4 +6,4 @@ router = Router()
 
 @router.message(Command("start"))
 async def cmd_start(message: Message):
-    await message.answer("Hello! I am an AI-powered bot. Send me a message and I will reply.")
+    await message.answer("Привет! Я бот. Доступные команды: /help")

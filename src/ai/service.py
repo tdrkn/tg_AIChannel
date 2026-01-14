@@ -2,25 +2,34 @@ import json
 import logging
 import asyncio
 import re
+from pathlib import Path
 from typing import List, Dict, Any, Optional
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from openai import AsyncOpenAI
-from google.api_core import exceptions
 
 from src.config.settings import get_settings
 from src.utils.search import web_search, image_search
 
 logger = logging.getLogger(__name__)
 
+
+class GenerationError(Exception):
+    def __init__(self, message: str, model_name: Optional[str], key_slot: Optional[str], cause: Optional[Exception] = None):
+        super().__init__(message)
+        self.model_name = model_name
+        self.key_slot = key_slot
+        self.cause = cause
+
 class LLMService:
-    def __init__(self):
+    def __init__(self, preferred_model: Optional[str] = None):
         self.settings = get_settings()
 
         self._google_api_keys: list[str] = []
-        # Prefer rotation list if provided
+        # Prefer rotation list if provided; only fall back to single key when list is empty.
         if getattr(self.settings, "google_api_keys", None):
             self._google_api_keys.extend([k for k in self.settings.google_api_keys if str(k).strip()])
-        if self.settings.google_api_key:
+        elif self.settings.google_api_key:
             self._google_api_keys.append(self.settings.google_api_key)
         # De-duplicate while preserving order
         deduped: list[str] = []
@@ -32,25 +41,35 @@ class LLMService:
         self._google_api_keys = deduped
         self._google_api_key_idx = 0
 
+        # Prioritized list of models to try
+        self.model_names = [
+            'gemini-3-flash',           # топ-вариант, если доступ есть
+            'gemini-2.5-flash-lite',    # щедрый бесплатный вариант
+            'gemini-2.5-flash',         # основной бесплатный/низкооплачиваемый
+            'gemini-2.0-flash',         # большой контекст
+            'gemini-2.0-flash-lite',
+            'gemini-1.5-flash'
+        ]
+        
+        # Override if specified
+        if preferred_model:
+            preferred_model = preferred_model.strip()
+            if preferred_model in self.model_names:
+                self.model_names.remove(preferred_model)
+                self.model_names.insert(0, preferred_model)
+            else:
+                 # If it's a completely new model, try it first
+                 self.model_names.insert(0, preferred_model)
+                 logger.info(f"Adding custom preferred model: {preferred_model}")
+
         if self._google_api_keys:
-            genai.configure(api_key=self._google_api_keys[self._google_api_key_idx])
-            logger.info(f"Configured Google API key 1/{len(self._google_api_keys)}")
-            
-            # Prioritized list of models to try
-            self.model_names = [
-                'gemini-3-flash-preview',
-                'gemini-3-flash',
-                #'gemini-2.5-flash', 
-                'gemini-2.0-flash', 
-                'gemini-1.5-flash',
-                'gemini-1.5-pro'
-            ]
+            self.client = genai.Client(api_key=self._google_api_keys[self._google_api_key_idx])
+            logger.info(f"Configured Google GenAI Client with key 1/{len(self._google_api_keys)}")
             self.current_model_name = self.model_names[0]
-            self.text_model = genai.GenerativeModel(self.current_model_name)
             logger.info(f"Initialized with model: {self.current_model_name}")
         else:
             logger.warning("GOOGLE_API_KEY(S) not set. text generation will fail.")
-            self.text_model = None
+            self.client = None
 
         if self.settings.openai_api_key:
             self.openai_client = AsyncOpenAI(api_key=self.settings.openai_api_key)
@@ -73,84 +92,105 @@ class LLMService:
         if not self._can_rotate_google_key():
             return False
         self._google_api_key_idx = (self._google_api_key_idx + 1) % len(self._google_api_keys)
-        genai.configure(api_key=self._google_api_keys[self._google_api_key_idx])
-        # Re-init current model under the new key
-        self.text_model = genai.GenerativeModel(self.current_model_name)
+        self.client = genai.Client(api_key=self._google_api_keys[self._google_api_key_idx])
         logger.warning(f"Rotated Google API key to {self._google_api_key_idx + 1}/{len(self._google_api_keys)}")
+        return True
+
+    def _advance_model(self) -> bool:
+        """Advance to the next model in the fallback list. Returns True if changed."""
+        if not getattr(self, "model_names", None):
+            return False
+        try:
+            idx = self.model_names.index(self.current_model_name)
+        except Exception:
+            idx = -1
+        next_idx = idx + 1
+        if next_idx >= len(self.model_names):
+            return False
+        self.current_model_name = self.model_names[next_idx]
         return True
 
     @staticmethod
     def _is_quota_error(err: Exception) -> bool:
+        # If we wrapped the original error, inspect the root cause too.
+        if hasattr(err, "cause") and getattr(err, "cause") is not None:
+            try:
+                err = err.cause  # type: ignore[assignment]
+            except Exception:
+                pass
         msg = str(err).lower()
         return (
-            isinstance(err, exceptions.ResourceExhausted)
-            or "quota" in msg
+            "quota" in msg
             or "rate limit" in msg
+            or "resource exhausted" in msg
+            or "exceeded" in msg
             or "429" in msg
         )
 
-    async def _generate_with_retry(self, prompt: str, retries: int = 3, delay: int = 5) -> str:
+    async def _generate_with_retry(self, prompt: str, retries: Optional[int] = None, delay: int = 5) -> str:
         """Helper to retry generation on 429 errors or switch models."""
+        if retries is None:
+            # Ensure we have enough attempts to actually traverse model fallbacks
+            # (and, if configured, multiple key slots).
+            model_count = len(getattr(self, "model_names", []) or [])
+            key_count = len(getattr(self, "_google_api_keys", []) or [])
+            variants = max(1, model_count) * max(1, key_count)
+            retries = max(3, min(12, variants))
+        last_err: Optional[Exception] = None
         for attempt in range(retries):
             try:
-                response = await self.text_model.generate_content_async(prompt)
+                logger.info(
+                    "LLM generate attempt %s/%s with model=%s key=%s",
+                    attempt + 1,
+                    retries,
+                    self.current_model_name,
+                    self.current_key_slot(),
+                )
+                response = await self.client.aio.models.generate_content(
+                    model=self.current_model_name,
+                    contents=prompt
+                )
+                logger.info(
+                    "LLM generate succeeded on model=%s key=%s",
+                    self.current_model_name,
+                    self.current_key_slot(),
+                )
                 return response.text
-            except (exceptions.ResourceExhausted, exceptions.NotFound, exceptions.GoogleAPIError) as e:
-                logger.warning(f"Model {self.current_model_name} failed: {e}. Attempt {attempt + 1}/{retries}")
-
+            except Exception as e:
+                last_err = e
                 quota_hit = self._is_quota_error(e)
+                logger.warning(
+                    "LLM generate failed (attempt %s/%s) model=%s key=%s quota=%s err=%s",
+                    attempt + 1,
+                    retries,
+                    self.current_model_name,
+                    self.current_key_slot(),
+                    quota_hit,
+                    e,
+                )
+
+                # Model rotation inside the same account:
+                # - On quota, ClientError, or ServerError: try the next model.
+                # Just assuming any Exception related to API might be retryable.
+                if quota_hit or "not found" in str(e).lower() or isinstance(e, ValueError):
+                    if self._advance_model():
+                        logger.info(f"Switching to fallback model: {self.current_model_name}")
+                        continue
+
+                # Key rotation (if multiple keys configured): use it only when model fallbacks are exhausted.
                 rotated = False
                 if quota_hit:
                     rotated = self._rotate_google_key()
-
-                current_idx = -1
-                if self.current_model_name in self.model_names:
-                    current_idx = self.model_names.index(self.current_model_name)
-
-                # On quota: also try a different model to avoid per-model quota exhaustion
-                if quota_hit and current_idx + 1 < len(self.model_names):
-                    self.current_model_name = self.model_names[current_idx + 1]
-                    logger.info(f"Switching to fallback model after quota: {self.current_model_name}")
-                    self.text_model = genai.GenerativeModel(self.current_model_name)
-                    continue
-
-                # Generic model fallback
-                if current_idx + 1 < len(self.model_names):
-                    self.current_model_name = self.model_names[current_idx + 1]
-                    logger.info(f"Switching to fallback model: {self.current_model_name}")
-                    self.text_model = genai.GenerativeModel(self.current_model_name)
-                    continue
-
-                # Quota hit, rotated key, but no other models left: retry same model with new key
                 if quota_hit and rotated:
                     logger.info("Retrying current model with rotated key after quota.")
                     continue
 
-                # No options left: backoff
+                # No options left: backoff and retry current
                 logger.warning("All models exhausted or hitting limits. Sleeping...")
                 await asyncio.sleep(delay)
                 delay *= 2
-            except ValueError as e:
-                # Happens when response has no text (finish_reason != 0). Treat as transient: try next model.
-                logger.warning(f"Empty/blocked response on model {self.current_model_name}: {e}. Attempt {attempt + 1}/{retries}")
 
-                current_idx = -1
-                if self.current_model_name in self.model_names:
-                    current_idx = self.model_names.index(self.current_model_name)
-
-                if current_idx + 1 < len(self.model_names):
-                    self.current_model_name = self.model_names[current_idx + 1]
-                    logger.info(f"Switching to fallback model: {self.current_model_name}")
-                    self.text_model = genai.GenerativeModel(self.current_model_name)
-                    continue
-
-                # No other models; backoff and retry current
-                await asyncio.sleep(delay)
-                delay *= 2
-            except Exception as e:
-                logger.error(f"Generation error: {e}")
-                raise e
-        raise Exception("Max retries exceeded for text generation.")
+        raise GenerationError("Max retries exceeded for text generation.", self.current_model_name, self.current_key_slot(), cause=last_err)
 
     async def select_winner(self, items: List[Dict]) -> Dict[str, Any]:
         """
@@ -160,7 +200,7 @@ class LLMService:
         if not items:
             return {}
         
-        if not self.text_model:
+        if not self.client:
              return {"winner_index": 0, "reasoning": "No LLM Configured", "search_queries": []}
 
         prompt = """
@@ -216,7 +256,7 @@ class LLMService:
 
         limit = self.settings.web_search_calls_limit
         for q in queries[:limit]:
-            results = web_search(q, max_results=2)
+            results = await web_search(q, max_results=2)
             for r in results:
                 consolidated_text += f"\nSource: {r['title']}\nURL: {r['href']}\nContent: {r['body']}\n"
         
@@ -225,13 +265,92 @@ class LLMService:
             
         return consolidated_text
 
+    @staticmethod
+    def _extract_json_string_field(text: str, field_name: str) -> Optional[str]:
+        """Best-effort extraction of a JSON string field even when the JSON is invalid.
+
+        Common failure mode: the model returns JSON with literal newlines inside quoted strings,
+        which breaks json.loads(). We scan for "field": "..." and read until the next unescaped quote.
+        """
+        needle = f'"{field_name}"'
+        start = text.find(needle)
+        if start < 0:
+            return None
+
+        i = start + len(needle)
+        # Find ':' then first opening quote
+        colon = text.find(":", i)
+        if colon < 0:
+            return None
+        j = colon + 1
+        while j < len(text) and text[j].isspace():
+            j += 1
+        if j >= len(text) or text[j] != '"':
+            return None
+        j += 1
+
+        out_chars: list[str] = []
+        escaped = False
+        while j < len(text):
+            ch = text[j]
+            if escaped:
+                out_chars.append(ch)
+                escaped = False
+                j += 1
+                continue
+            if ch == "\\":
+                out_chars.append(ch)
+                escaped = True
+                j += 1
+                continue
+            if ch == '"':
+                return "".join(out_chars)
+            out_chars.append(ch)
+            j += 1
+        return None
+
+    def _parse_generation_json(self, text: str) -> Dict[str, str]:
+        """Parse the model output into {post_text, image_prompt} with fallbacks."""
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict):
+                return {
+                    "post_text": str(data.get("post_text", "")),
+                    "image_prompt": str(data.get("image_prompt", "")),
+                }
+        except Exception:
+            pass
+
+        # Try to extract a JSON object substring
+        try:
+            left = text.find("{")
+            right = text.rfind("}")
+            if left >= 0 and right > left:
+                data = json.loads(text[left : right + 1])
+                if isinstance(data, dict):
+                    return {
+                        "post_text": str(data.get("post_text", "")),
+                        "image_prompt": str(data.get("image_prompt", "")),
+                    }
+        except Exception:
+            pass
+
+        # Last-resort: pull the two fields manually.
+        post_text = self._extract_json_string_field(text, "post_text") or ""
+        image_prompt = self._extract_json_string_field(text, "image_prompt") or ""
+        if post_text or image_prompt:
+            return {"post_text": post_text, "image_prompt": image_prompt}
+
+        # If everything fails, treat the full text as post_text.
+        return {"post_text": text.strip(), "image_prompt": ""}
+
     async def generate_post(self, winner_item: Dict, research_context: str) -> Dict[str, str]:
         """
         Generates the final post text and image prompt.
         """
         template = self.settings.post_template
         
-        if not self.text_model:
+        if not self.client:
              return {
                 "post_text": f"<b>{winner_item.get('title')}</b>\n\n{winner_item.get('summary')}\n\n{winner_item.get('link')}",
                 "image_prompt": ""
@@ -239,6 +358,11 @@ class LLMService:
 
         # Use system prompt from .env or fallback to default
         system_instruction = self.settings.system_prompt
+        if not system_instruction and getattr(self.settings, "system_prompt_file", None):
+            try:
+                system_instruction = Path(self.settings.system_prompt_file).read_text(encoding="utf-8")
+            except Exception as ex:
+                logger.warning(f"Failed to read SYSTEM_PROMPT_FILE={self.settings.system_prompt_file}: {ex}")
         if not system_instruction:
             system_instruction = """
             ACT AS A PROFESSIONAL RUSSIAN TECH JOURNALIST.
@@ -261,10 +385,10 @@ class LLMService:
         TASK:
         Generate a Telegram post ('post_text') content based on the SYSTEM INSTRUCTIONS and INPUT DATA.
         Make it short and clean:
-        - target length: 450–900 chars total (hard max: {self.settings.post_max_chars})
+        - target length: 300–600 chars total (hard max: {self.settings.post_max_chars})
         - NO long intros, NO повторов, NO канцелярита
-        - 2–3 коротких абзаца + 3 буллита (не больше)
-        - emoji budget: максимум {self.settings.post_max_emojis} эмодзи на весь пост, только по делу (не в каждом предложении)
+        - 2 коротких абзаца + 2–3 буллита (не больше)
+        - emoji budget: максимум {self.settings.post_max_emojis} эмодзи на весь пост, только по делу
         - keep HTML valid; DO NOT output any <a href=...> links (footer will be appended automatically)
         Also generate an 'image_prompt' in English using these GUIDELINES:
         "minimalist conceptual illustration for a viral news post.
@@ -292,7 +416,7 @@ class LLMService:
                 text = text.replace("```json", "").replace("```", "")
             if text.startswith("```"):
                 text = text.replace("```", "")
-            data = json.loads(text)
+            data = self._parse_generation_json(text)
             post_text = self._polish_post_text(
                 data.get("post_text", ""),
                 max_chars=self.settings.post_max_chars,
@@ -303,16 +427,20 @@ class LLMService:
         except Exception as e:
             logger.error(f"Error generating post after retries: {e}", exc_info=True)
             # Fail gracefully; distinguish quota from other failures.
+            model_info = getattr(e, "model_name", None) or self.current_model() or "n/a"
+            key_info = getattr(e, "key_slot", None) or self.current_key_slot() or "n/a"
             if self._is_quota_error(e):
                 msg = (
                     "⚠️ <b>Ошибка генерации поста (Google AI Quota).</b>\n\n"
                     f"Не удалось перевести новость: <b>{winner_item.get('title')}</b>\n\n"
+                    f"Модель: {model_info}, ключ: {key_info}.\n"
                     "Попробуйте позже или используйте другой ключ."
                 )
             else:
                 msg = (
                     "⚠️ <b>Ошибка генерации поста.</b>\n\n"
                     f"Не удалось обработать новость: <b>{winner_item.get('title')}</b>\n\n"
+                    f"Модель: {model_info}, ключ: {key_info}.\n"
                     "Попробуйте позже или смените модель/ключ."
                 )
             return {
@@ -419,7 +547,7 @@ class LLMService:
         delay = float(self.settings.image_search_retry_delay_sec)
 
         for attempt in range(retries):
-            url = self._search_image_url(prompt)
+            url = await self._search_image_url(prompt)
             if url:
                 return url
             if attempt + 1 < retries:
@@ -462,7 +590,7 @@ class LLMService:
 
         return t
 
-    def _search_image_url(self, prompt: str) -> Optional[str]:
+    async def _search_image_url(self, prompt: str) -> Optional[str]:
         """Find a relevant image URL via search, using the same prompt text."""
         prompt_clean = " ".join((prompt or "").split())
         base_query = self._prompt_to_image_query(prompt_clean)
@@ -483,7 +611,7 @@ class LLMService:
                 self.settings.image_search_safesearch,
                 self.settings.image_search_max_results,
             )
-            results = image_search(
+            results = await image_search(
                 q,
                 max_results=self.settings.image_search_max_results,
                 safesearch=self.settings.image_search_safesearch,

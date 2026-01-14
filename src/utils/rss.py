@@ -17,12 +17,15 @@ async def fetch_feed_content(client: httpx.AsyncClient, url: str) -> Optional[st
         logger.error(f"Error fetching {url}: {e}")
         return None
 
-async def fetch_rss_entries(rss_urls: List[str], hours: int = 6) -> List[Dict]:
+async def fetch_rss_entries(rss_urls: List[str], hours: int = 6) -> tuple[List[Dict], List[str]]:
     """
-    Fetch and parse RSS feeds. Returns list of entries with title/summary/link.
-    Filters entries older than 'hours' hours.
+    Fetch and parse RSS feeds. 
+    Returns:
+        1. List of entries (title/summary/link) filtered by 'hours'.
+        2. List of source names (titles) that were successfully fetched (active sources).
     """
     entries = []
+    active_sources = set()
     since_time = datetime.utcnow() - timedelta(hours=hours)
     
     async with httpx.AsyncClient(follow_redirects=True) as client:
@@ -33,7 +36,20 @@ async def fetch_rss_entries(rss_urls: List[str], hours: int = 6) -> List[Dict]:
         if not content:
             continue
         
-        feed = feedparser.parse(content)
+        # Offload parsing to thread to avoid blocking loop
+        try:
+            feed = await asyncio.to_thread(feedparser.parse, content)
+        except Exception as e:
+            logger.error(f"Error parsing feed content for {url}: {e}")
+            continue
+
+        # Record this source as active
+        if hasattr(feed, "feed") and feed.feed.get("title"):
+            active_sources.add(feed.feed.get("title"))
+        else:
+            # Fallback to domain or url if no title
+            active_sources.add(url)
+
         # Check bozo but sometimes valid feeds trigger it
         if feed.bozo:
              logger.warning(f"Feed {url} potential issue: {feed.bozo_exception}")
@@ -51,13 +67,15 @@ async def fetch_rss_entries(rss_urls: List[str], hours: int = 6) -> List[Dict]:
                  if published < since_time:
                      continue
             
+            source_name = feed.feed.get("title", url) if hasattr(feed, "feed") else url
+            
             entries.append({
                 "title": entry.get("title", ""),
                 "link": entry.get("link", ""),
                 "summary": entry.get("summary", "") or entry.get("description", ""),
                 "published_at": published,
-                "source": feed.feed.get("title", url)
+                "source": source_name
             })
             
-    logger.info(f"Fetched {len(entries)} items from {len(rss_urls)} feeds.")
-    return entries
+    logger.info(f"Fetched {len(entries)} items from {len(rss_urls)} feeds. Active sources detected: {len(active_sources)}")
+    return entries, list(active_sources)
