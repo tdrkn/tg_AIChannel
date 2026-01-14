@@ -45,6 +45,8 @@ class Settings(BaseSettings):
     # Limits
     max_items_per_run: int = 80
     candidates_for_llm: int = 30
+    candidate_pool_multiplier: int = 5
+    max_candidates_per_source: int = 6
     web_search_calls_limit: int = 3
     llm_timeout: int = 30
     http_timeout: int = 10

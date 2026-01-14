@@ -1,7 +1,7 @@
 import logging
 import asyncio
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, Dict, List
 from sqlalchemy import select, desc
 from sqlalchemy.dialects.postgresql import insert
 from aiogram import Bot
@@ -21,6 +21,43 @@ logger = logging.getLogger(__name__)
 def _is_http_url(value: str) -> bool:
     v = (value or "").strip().lower()
     return v.startswith("http://") or v.startswith("https://")
+
+
+def _balance_candidates_by_source(
+    items: List[Item],
+    total: int,
+    max_per_source: int,
+) -> List[Item]:
+    """Pick up to `total` items, spreading across sources.
+
+    Items must be pre-sorted by recency (desc). We keep order within each source
+    and select in round-robin to prevent a single RSS from dominating.
+    """
+    by_source: Dict[str, List[Item]] = {}
+    for it in items:
+        src = (it.source or "unknown").strip() or "unknown"
+        by_source.setdefault(src, []).append(it)
+
+    sources = list(by_source.keys())
+    per_source_taken: Dict[str, int] = {s: 0 for s in sources}
+    idx: Dict[str, int] = {s: 0 for s in sources}
+
+    out: List[Item] = []
+    made_progress = True
+    while len(out) < total and made_progress:
+        made_progress = False
+        for s in sources:
+            if len(out) >= total:
+                break
+            if per_source_taken[s] >= max_per_source:
+                continue
+            if idx[s] >= len(by_source[s]):
+                continue
+            out.append(by_source[s][idx[s]])
+            idx[s] += 1
+            per_source_taken[s] += 1
+            made_progress = True
+    return out
 
 async def run_pipeline(bot: Optional[Bot] = None):
     settings = get_settings()
@@ -79,13 +116,20 @@ async def run_pipeline(bot: Optional[Bot] = None):
             # Subquery to find item_ids that are already in Posts
             used_items_subquery = select(Post.item_id).where(Post.item_id.is_not(None))
             
+            pool_limit = max(settings.candidates_for_llm * settings.candidate_pool_multiplier, settings.candidates_for_llm)
             stmt = select(Item).where(
                 Item.published_at >= datetime.utcnow() - timedelta(hours=24),
                 Item.id.not_in(used_items_subquery)
-            ).order_by(Item.published_at.desc()).limit(settings.candidates_for_llm)
+            ).order_by(Item.published_at.desc()).limit(pool_limit)
             
             candidates_result = await session.execute(stmt)
-            candidates = candidates_result.scalars().all()
+            pool = candidates_result.scalars().all()
+
+            candidates = _balance_candidates_by_source(
+                pool,
+                total=settings.candidates_for_llm,
+                max_per_source=settings.max_candidates_per_source,
+            )
             
             candidates_dicts = [
                 {"title": c.title, "source": c.source, "summary": c.summary, "link": c.link, "id": c.id}
