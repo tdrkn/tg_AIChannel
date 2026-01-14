@@ -2,7 +2,7 @@ from functools import lru_cache
 import json
 from typing import Optional
 
-from pydantic import field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -38,7 +38,7 @@ class Settings(BaseSettings):
     image_search_retry_delay_sec: float = 0.7
     
     # Admin
-    admin_user_ids: list[int] = []
+    admin_user_ids: list[int] = Field(default_factory=list)
 
     # App Settings
     auto_publish: bool = False
@@ -49,7 +49,7 @@ class Settings(BaseSettings):
     candidates_for_llm: int = 30
     candidate_pool_multiplier: int = 5
     max_candidates_per_source: int = 6
-    source_candidate_caps: dict[str, int] = {}
+    source_candidate_caps: dict[str, int] = Field(default_factory=dict)
     source_cooldown_hours: int = 6
     source_cooldown_cap_penalty: int = 2
     web_search_calls_limit: int = 3
@@ -76,7 +76,45 @@ class Settings(BaseSettings):
     def database_url(self) -> str:
         return f"postgresql+asyncpg://{self.postgres_user}:{self.postgres_password}@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
 
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+    # NOTE: We disable automatic JSON-decoding for complex fields so that we can
+    # support both JSON and simple comma-separated formats from .env.
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", enable_decoding=False)
+
+    @field_validator("admin_user_ids", mode="before")
+    @classmethod
+    def _parse_admin_user_ids(cls, v):
+        """Supports JSON list ([1,2]) and convenient '1,2' formats."""
+        if v is None or v == "":
+            return []
+        if isinstance(v, list):
+            out: list[int] = []
+            for x in v:
+                try:
+                    out.append(int(x))
+                except Exception:
+                    continue
+            return out
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return []
+            if s.startswith("["):
+                try:
+                    parsed = json.loads(s)
+                    if isinstance(parsed, list):
+                        return [int(x) for x in parsed if str(x).strip()]
+                except Exception:
+                    return []
+            # Comma/space separated: 123,456 or 123 456
+            parts = [p.strip() for p in s.replace(" ", ",").split(",") if p.strip()]
+            out: list[int] = []
+            for part in parts:
+                try:
+                    out.append(int(part))
+                except Exception:
+                    continue
+            return out
+        return []
 
     @field_validator("source_candidate_caps", mode="before")
     @classmethod
