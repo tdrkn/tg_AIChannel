@@ -126,7 +126,7 @@ class LLMService:
             or "exceeded" in msg
             or "429" in msg
         )
-
+q
     async def _generate_with_retry(self, prompt: str, retries: Optional[int] = None, delay: int = 5) -> str:
         """Helper to retry generation on 429 errors or switch models."""
         if retries is None:
